@@ -1,0 +1,435 @@
+// Copyright 2013 Steve Kelly. All rights reserved. Based on EagleUp by J.Lamy
+//
+// Redistribution and use in source and binary forms, with or without modification, are
+// permitted provided that the following conditions are met:
+//
+//   1. Redistributions of source code must retain the above copyright notice, this list of
+//      conditions and the following disclaimer.
+//
+//   2. Redistributions in binary form must reproduce the above copyright notice, this list
+//      of conditions and the following disclaimer in the documentation and/or other materials
+//      provided with the distribution.
+//
+// THIS SOFTWARE IS PROVIDED BY THE AUTHOR ``AS IS'' AND ANY EXPRESS OR IMPLIED
+// WARRANTIES, INCLUDING, BUT NOT LIMITED TO, THE IMPLIED WARRANTIES OF MERCHANTABILITY AND
+// FITNESS FOR A PARTICULAR PURPOSE ARE DISCLAIMED. IN NO EVENT SHALL J.Lamy OR
+// CONTRIBUTORS BE LIABLE FOR ANY DIRECT, INDIRECT, INCIDENTAL, SPECIAL, EXEMPLARY, OR
+// CONSEQUENTIAL DAMAGES (INCLUDING, BUT NOT LIMITED TO, PROCUREMENT OF SUBSTITUTE GOODS OR
+// SERVICES; LOSS OF USE, DATA, OR PROFITS; OR BUSINESS INTERRUPTION) HOWEVER CAUSED AND ON
+// ANY THEORY OF LIABILITY, WHETHER IN CONTRACT, STRICT LIABILITY, OR TORT (INCLUDING
+// NEGLIGENCE OR OTHERWISE) ARISING IN ANY WAY OUT OF THE USE OF THIS SOFTWARE, EVEN IF
+// ADVISED OF THE POSSIBILITY OF SUCH DAMAGE.
+
+
+
+#usage "<b>Exports a board to Gcode</b>\n"
+"<p>Generates a 3D model of the board and components."
+"<p>Documentation avaliable at http://github.com/"
+"<p><author>Author: sjkelly@wpi.edu</author>"
+
+#require 5.0900					// functions netget, cfgget and cfgset only available on versions 5.9 and newer
+// another version is available for older Eagle installations
+
+// gloabal variables
+string rm_cmd, mkdir_cmd, export_path, cmd;
+int grid_unit;			// keep the used grid unit
+
+// Convert unity to mic, mm, mil or inch using board grid settings.
+real u2u(int val)
+{
+  switch (grid_unit)
+    {
+    case GRID_UNIT_MIC  :
+      return u2mic(val);
+    case GRID_UNIT_MM   :
+      return u2mm(val);
+    case GRID_UNIT_MIL  :
+      return u2mil(val);
+    case GRID_UNIT_INCH :
+      return u2inch(val);
+    }
+}
+
+// find string s2 in s1, and replace with s3
+string replace_string(string s1, string s2, string s3)
+{
+  int i, pos = 1;
+  string a = s1;
+  while (pos >= 0)
+    {
+      pos = strstr(a, s2);
+      if (pos < 0) break;
+      string st1 = strsub(a, 0, pos);
+      string st2 = strsub(a, pos + strlen(s2));
+      a = st1+s3+st2;
+    }
+  return a;
+}
+
+string up_one_folder( string path )
+{
+  return strsub( path , 0 , strrstr( path , "/" , strlen(path)-2 )+1 );
+}
+
+int correct_settings( void )
+{
+  int failed = 0;
+
+  //replacing wrong characters automatically
+  export_path = replace_string( export_path , "\\" , "/" );
+
+  // export path can be empty
+  // if not empty, \ are replaced automatically by /
+  // the last character should be a / automatically added
+  if( export_path != "" )
+    {
+      if( strsub(export_path,strlen(export_path)-1,1) != "/" )
+        export_path = export_path + "/";
+    }
+
+  return failed;
+}
+
+/* OS detection function suggested by Andreas Weidner
+http://www.eaglecentral.ca/forums/index.php?t=msg&goto=139751 */
+int is_windows()
+{
+  //Returns 1, if EAGLE is running under Windows (0 for Linux/Mac)
+  if ((strsub(argv[0],0,1)=="/") && (strsub(argv[0],0,2)!="//"))
+    return 0;
+  return 1;
+}
+
+/* functions below are used to check and correct the curved edges of the board */
+
+real deg_to_rad(real deg)
+{
+  return (deg/360)*(2*PI);
+}
+
+real get_arc_mid_x(UL_ARC arc)
+{
+  // Get an angle at the midpoint
+  int x1i, y1i;
+  real da = deg_to_rad((arc.angle1 - arc.angle2)/2);
+  if(da > 0)
+    {
+      x1i = arc.x1;
+      y1i = arc.y1;
+    }
+  else
+    {
+      x1i = arc.x2;
+      y1i = arc.y2;
+    }
+  // rotate point
+  return ((x1i-arc.xc) * cos(da) - (y1i-arc.yc) * sin(da)) + arc.xc;
+}
+
+real get_arc_mid_y(UL_ARC arc)
+{
+  // Get an angle at the midpoint
+  int x1i, y1i;
+  real da = deg_to_rad((arc.angle1 - arc.angle2)/2);
+
+  if(da > 0)
+    {
+      x1i = arc.x1;
+      y1i = arc.y1;
+    }
+  else
+    {
+      x1i = arc.x2;
+      y1i = arc.y2;
+    }
+  // rotate point
+  return ((x1i-arc.xc) * sin(da) + (y1i-arc.yc) * cos(da)) + arc.yc;
+}
+
+real get_wire_max_v(UL_WIRE wire)
+{
+  if(wire.arc)
+    return max(wire.y1, max(wire.y2, get_arc_mid_y(wire.arc)));
+  else
+    return max(wire.y1, wire.y2);
+}
+
+real get_wire_max_h(UL_WIRE wire)
+{
+  if(wire.arc)
+    return max(wire.x1, max(wire.x2, get_arc_mid_x(wire.arc)));
+  else
+    return max(wire.x1, wire.x2);
+}
+
+real get_wire_min_v(UL_WIRE wire)
+{
+  if(wire.arc)
+    return min(wire.y1, min(wire.y2, get_arc_mid_y(wire.arc)));
+  else
+    return min(wire.y1, wire.y2);
+}
+
+real get_wire_min_h(UL_WIRE wire)
+{
+  if(wire.arc)
+    return min(wire.x1, min(wire.x2, get_arc_mid_x(wire.arc)));
+  else
+    return min(wire.x1, wire.x2);
+}
+
+string list_active_layers( void )	// list all visible layers in a string with space separation between numbers
+{
+  string active_layers;
+  board (B)
+  {
+    B.layers(L)
+    {
+      if(L.visible == 1)
+        sprintf( active_layers , "%s %d" , active_layers , L.number );
+    }
+  }
+  return (active_layers + ";\n");
+}
+
+void help_box(void)
+{
+  dlgMessageBox( "This is the first time you ran generate-gcode.ulp The next window will help you configure your local settings. All your preferences are saved and will be restored when you run generate-scad.ulp the next time." );
+}
+
+
+
+
+/* main function starts here */
+
+// only runs in the board, not schematic or library
+if (board) board(B)
+  {
+    int major_version = 0;
+    int minor_version = 1;
+    string url = "http://github.com/";
+    string genscad_version;
+    sprintf( genscad_version , "%d.%d" , major_version , minor_version);
+
+    real board_thickness;
+    real z_lift;
+    real move_feed;
+    real z_drill_feed;
+    real z_removal_feed;
+    real x_offset;
+    real y_offset;
+    int outline_layer;
+    int board_only;
+    string export_path;
+
+    board(B)
+    {
+      grid_unit = (B.grid.unit);
+    }
+    string active_layers = list_active_layers();
+
+    if( argv[1] == "completed" )
+      {
+        dlgMessageBox( "generate-gcode.ulp " + genscad_version + " : <b>export completed</b>" );
+        exit(cmd);
+      }
+
+
+    // path for config file on old versions, something like "C:/Program Files/EAGLE-X.Y/ulp/eagleUp_export.settings.txt"
+    string settings_file = filesetext( argv[0] , ".settings.txt");	// argv[0] is the full path of this ULP
+
+    /* read parameters from user's eaglerc file, if first run => use default values */
+    //***5.9
+    z_lift 			= strtod( cfgget( "gengcode.z_lift" , 		"5" ) );
+    move_feed 			= strtod( cfgget( "gengcode.z_lift" , 		"20" ) );
+    z_drill_feed 			= strtod( cfgget( "gengcode.z_lift" , 		"0.5" ) );
+    z_removal_feed 			= strtod( cfgget( "gengcode.z_lift" , 		"5" ) );
+    x_offset 			= strtod( cfgget( "gengcode.z_lift" , 		"20" ) );
+    y_offset 			= strtod( cfgget( "gengcode.z_lift" , 		"20" ) );
+
+   // board_color_selected 		= strtol( cfgget( "genscad.board_color_selected" , 	"1" ) );		// default => red
+   // outline_layer 			= strtol( cfgget( "genscad.outline_layer" , 		"0" ) );		// default => dimension
+  //  board_only 				= strtol( cfgget( "genscad.board_only" , 			"0" ) );		// default => disabled
+
+    // automatic OS detection for OS specific commands
+    if( is_windows() )
+      {
+        rm_cmd = "del";
+        mkdir_cmd = "cmd.exe /c mkdir";		// include system call
+      }
+    else
+      {
+        rm_cmd = "rm";
+        mkdir_cmd = "mkdir";				// on linux and mac OS, no need to call terminal
+      }
+
+    int dlg_accepted = dlgDialog("Generate-OpenSCAD " + genscad_version + " Parameters")
+    {
+      dlgHBoxLayout
+      {
+        dlgStretch(1);
+        dlgVBoxLayout
+        {
+          dlgStretch(1);
+          dlgGroup("Outline layer")
+          {
+            dlgHBoxLayout
+            {
+              dlgRadioButton("(20) Dimension", outline_layer);
+              dlgRadioButton("(46) Milling", outline_layer);
+            }
+          };
+          dlgGridLayout {
+            dlgCell( 1 , 0 ) dlgLabel("Z Lift between holes (mm)");
+            dlgCell( 1 , 1 ) dlgRealEdit(z_lift, 0.0, 500.0);
+            dlgCell( 2 , 0 ) dlgLabel("Move Feedrate (mm/s)");
+            dlgCell( 2 , 1 ) dlgRealEdit(move_feed, 0.0, 500.0);
+            dlgCell( 3 , 0 ) dlgLabel("Drill Feedrate (mm/s)");
+            dlgCell( 3 , 1 ) dlgRealEdit(z_drill_feed, 0.0, 500.0);
+            dlgCell( 4 , 0 ) dlgLabel("Removal Feedrate (mm/s)");
+            dlgCell( 4 , 1 ) dlgRealEdit(z_removal_feed, 0.0, 500.0);
+            dlgCell( 5 , 0 ) dlgLabel("X offset (mm)");
+            dlgCell( 5 , 1 ) dlgRealEdit(x_offset, 0.0, 500.0);
+            dlgCell( 6 , 0 ) dlgLabel("Y offset (mm)");
+            dlgCell( 6 , 1 ) dlgRealEdit(y_offset, 0.0, 500.0);
+            dlgCell( 7 , 0 ) dlgLabel("Export subfolder");
+            dlgCell( 7 , 1 ) dlgStringEdit(export_path);
+          }
+          dlgHBoxLayout {
+            dlgStretch(1);
+            dlgPushButton("+OK") dlgAccept(1);
+            dlgPushButton("Cancel") dlgReject(-1);
+            dlgPushButton("Help") help_box();
+            dlgStretch(1);
+          }
+          dlgStretch(1);
+        }
+        dlgStretch(1);
+      }
+    };
+
+    if( dlg_accepted == -1)
+      exit(-1);
+
+    /* save in user's eaglerc file the settings */
+    string str_setting;	// used to buffer the decimal values
+
+    sprintf( str_setting , "%.2f" , z_lift );
+    cfgset( "gengcode.z_lift" , 		str_setting );
+    str_setting = "";
+    sprintf( str_setting , "%.2f" , move_feed );
+    cfgset( "gengcode.move_feed" , 		str_setting );
+    str_setting = "";
+    sprintf( str_setting , "%.2f" , z_drill_feed );
+    cfgset( "gengcode.z_drill_feed" , 		str_setting );
+    str_setting = "";
+    sprintf( str_setting , "%.2f" , z_removal_feed );
+    cfgset( "gengcode.z_removal_feed" , 		str_setting );
+    str_setting = "";
+    sprintf( str_setting , "%.2f" , x_offset );
+    cfgset( "gengcode.x_offset" , 		str_setting );
+    str_setting = "";
+    sprintf( str_setting , "%.2f" , y_offset );
+    cfgset( "gengcode.y_offset" , 		str_setting );
+
+// if subfolder defined, and does not exist, create it automatically
+// unfortunately this uses a system() call and a popup for the user in versions < 5.11
+    if( export_path != "" )
+      {
+        string a[];
+        int folder_found =0;
+        int nglob = fileglob(a, filedir(B.name) + "*");
+        for( int i=0 ; i<nglob ; i++)
+          {
+            if( strsub( a[i] , strlen( a[i] )-1 , 1 ) == "/" )		// is a folder
+              {
+                // extract folder name by removing board directory
+                if(   strsub( a[i] , strlen(filedir(B.name) ) ) == export_path )
+                  // found the path
+                  folder_found =1;
+
+              }
+          }
+        if( folder_found == 0 )
+          {
+
+            if( EAGLE_VERSION == 5 && EAGLE_RELEASE < 11 )
+              dlgMessageBox( "You have set in the general settings the subfolder " + export_path + " for your eagleUp files.\nEagle might show a popup requesting confirmation for a system command. This is normal, the command only creates the missing subfolder." );
+
+            string a[];
+            strsplit(a, filedir(B.name)+strsub( export_path , 0 , strlen( export_path )-1 ), '/');
+            string new_folder_path;
+            if( is_windows() )
+              new_folder_path = strjoin(a, '\\');
+            else
+              new_folder_path = strjoin(a, '/');
+
+            system( mkdir_cmd + " " + "\"" + new_folder_path + "\"");
+
+          }
+      }
+
+// include model_path in path
+    string scad_file = filesetext( filedir(B.name) + export_path + filename( B.name )  ,  ".gcode");
+    output( scad_file , "wt")
+    {
+
+      // Prefix used to store the images
+      string directory = filedir(B.name) + export_path;
+
+      /* Starting data for .gcode file */
+      printf("G28\n");
+      printf("G1 Z0\n");
+      printf("G1 Z%f F%f\n", z_lift, z_removal_feed*60);
+      // list the holes of the board hole, x, y, radius,
+      int holes=0;
+
+      B.holes(H)
+      {
+        real x_loc = u2mm(H.x) + x_offset;
+        real y_loc = u2mm(H.y) + y_offset;
+                 printf("G1 X%.3f Y%.3f F%f\n" , x_loc , y_loc , move_feed*60);
+                 printf("G1 Z0 F%f\n" , z_drill_feed*60);
+                 printf("G1 Z%f F%f\n" , z_lift, z_removal_feed*60);
+      }
+
+      B.elements(E)
+      {
+        E.package.holes(H)
+        {
+            real x_loc = u2mm(H.x) + x_offset;
+            real y_loc = u2mm(H.y) + y_offset;
+                 printf("G1 X%.3f Y%.3f F%f\n" , x_loc , y_loc , move_feed*60);
+                 printf("G1 Z0 F%f\n" , z_drill_feed*60);
+                 printf("G1 Z%f F%f\n" , z_lift, z_removal_feed*60);
+        }
+      }
+
+      B.elements(E)
+      {
+        E.package.contacts(C)
+        {
+          if (C.pad)
+            {
+            real x_loc = u2mm(C.x) + x_offset;
+            real y_loc = u2mm(C.y) + y_offset;
+                 printf("G1 X%.3f Y%.3f F%f\n" , x_loc , y_loc , move_feed*60);
+                 printf("G1 Z0 F%f\n" , z_drill_feed*60);
+                 printf("G1 Z%f F%f\n" , z_lift, z_removal_feed*60);
+            }
+        }
+      }
+    }
+
+// re-launch the ULP with extra argument to display end message
+    cmd += "run '" + argv[0] + "' completed;\n";
+
+// exit and execute the command list
+    exit( cmd );
+  }
+else // if not launched from a board
+  {
+    dlgMessageBox("\n    Please launch this ULP in a Board    \n");
+    exit (0);
+ }
+/* end of file */
